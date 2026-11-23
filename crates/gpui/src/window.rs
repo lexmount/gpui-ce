@@ -1,19 +1,20 @@
 use crate::{
     Action, AnyDrag, AnyElement, AnyImageCache, AnyTooltip, AnyView, App, AppContext, Arena, Asset,
-    AsyncWindowContext, AtlasTile, AvailableSpace, BackdropFilter, Background, BorderStyle, Bounds,
-    BoxShadow, Capslock, Context, Corners, CursorHideMode, CursorStyle, Decorations, DevicePixels,
-    DispatchActionListener, DispatchNodeId, DispatchTree, DisplayId, Edges, Effect, Entity,
-    EntityId, EventEmitter, FileDropEvent, Filter, FilterBoundary, FontId, Global, GlobalElementId,
-    GlyphId, GlyphRenderMode, GpuSpecs, InputHandler, IntoElement, IsZero, KeyBinding, KeyContext,
-    KeyDownEvent, KeyEvent, Keystroke, KeystrokeEvent, LayoutId, Lerp, LineLayoutIndex, Modifiers,
-    ModifiersChangedEvent, MonochromeSprite, Motion, MouseButton, MouseEvent, MouseMoveEvent,
-    MouseUpEvent, PaintSurface, Path, Pixels, PlatformAtlas, PlatformDisplay, PlatformInput,
-    PlatformInputHandler, PlatformWindow, Point, PolychromeSprite, Priority, PromptButton,
-    PromptLevel, Quad, RasterizedGlyphFormat, Render, RenderGlyphParams, RenderImage,
-    RenderImageParams, RenderSvgParams, Replay, ResizeEdge, ResolvedDirection,
-    SMOOTH_SVG_SCALE_FACTOR, SUBPIXEL_VARIANTS_X, SUBPIXEL_VARIANTS_Y, ScaledFilter, ScaledPixels,
-    Scene, Shadow, SharedString, Size, StrikethroughStyle, Style, SubpixelSprite, SubscriberSet,
-    Subscription, SystemWindowTab, SystemWindowTabController, TabStopMap, TaffyLayoutEngine, Task,
+    AsyncWindowContext, AtlasTextureKind, AtlasTile, AvailableSpace, BackdropFilter, Background,
+    BgraImage, BorderStyle, Bounds, BoxShadow, Capslock, Context, Corners, CursorHideMode,
+    CursorStyle, Decorations, DevicePixels, DispatchActionListener, DispatchNodeId, DispatchTree,
+    DisplayId, Edges, Effect, Entity, EntityId, EventEmitter, FileDropEvent, Filter,
+    FilterBoundary, FontId, Global, GlobalElementId, GlyphId, GlyphRenderMode, GpuSpecs,
+    InputHandler, IntoElement, IsZero, KeyBinding, KeyContext, KeyDownEvent, KeyEvent, Keystroke,
+    KeystrokeEvent, LayoutId, Lerp, LineLayoutIndex, Modifiers, ModifiersChangedEvent,
+    MonochromeSprite, Motion, MouseButton, MouseEvent, MouseMoveEvent, MouseUpEvent, PaintSurface,
+    Path, Pixels, PlatformAtlas, PlatformDisplay, PlatformInput, PlatformInputHandler,
+    PlatformWindow, Point, PolychromeSprite, Priority, PromptButton, PromptLevel, Quad,
+    RasterizedGlyphFormat, Render, RenderGlyphParams, RenderImage, RenderImageParams,
+    RenderSvgParams, Replay, ResizeEdge, ResolvedDirection, SMOOTH_SVG_SCALE_FACTOR,
+    SUBPIXEL_VARIANTS_X, SUBPIXEL_VARIANTS_Y, ScaledFilter, ScaledPixels, Scene, Shadow,
+    SharedString, Size, StrikethroughStyle, Style, SubpixelSprite, SubscriberSet, Subscription,
+    SystemWindowTab, SystemWindowTabController, TabStopMap, TaffyLayoutEngine, Task,
     TextInputConfiguration, TextInputStateChange, TextRenderingMode, TextStyle,
     TextStyleRefinement, ThermalState, TransformationMatrix, Transition, TransitionState,
     Underline, UnderlineStyle, UnicodeBidi, WindowAppearance, WindowBackgroundAppearance,
@@ -5137,8 +5138,6 @@ impl Window {
             })?
             .expect("Callback above only returns Some");
 
-        let visible_bounds_snapped = self.snap_bounds(visible_bounds);
-
         let sub_tile = if visible_bounds == image_bounds {
             tile
         } else {
@@ -5179,6 +5178,61 @@ impl Window {
             }
         };
 
+        self.push_image_sprite(
+            visible_bounds,
+            corner_radii,
+            corner_smoothing,
+            grayscale,
+            sub_tile,
+        );
+        Ok(())
+    }
+
+    /// Paints a BGRA8 image scaled to the specified bounds during the paint phase.
+    /// On a cache miss, the atlas uploads the borrowed slice before returning.
+    /// Pass no pixels to paint only if the image is already in the atlas.
+    /// Returns whether a sprite was added to the scene.
+    pub fn paint_bgra_image(
+        &mut self,
+        bounds: Bounds<Pixels>,
+        image: &BgraImage,
+        pixels: Option<&[u8]>,
+    ) -> Result<bool> {
+        self.invalidator.debug_assert_paint();
+        if bounds.size.width <= Pixels::ZERO || bounds.size.height <= Pixels::ZERO {
+            return Ok(false);
+        }
+        let tile = self
+            .sprite_atlas
+            .get_or_insert_with(&image.params().into(), &mut || {
+                if let Some(pixels) = pixels {
+                    AtlasTextureKind::Polychrome.validate_upload(image.size, pixels)?;
+                    Ok(Some((image.size, Cow::Borrowed(pixels))))
+                } else {
+                    Ok(None)
+                }
+            })?;
+        let Some(tile) = tile else {
+            return Ok(false);
+        };
+        self.push_image_sprite(bounds, Corners::default(), 0.0, false, tile);
+        Ok(true)
+    }
+
+    /// Removes the atlas entry for a borrowed BGRA8 image.
+    pub fn drop_bgra_image(&mut self, image: &BgraImage) {
+        self.sprite_atlas.remove(&image.params().into());
+    }
+
+    fn push_image_sprite(
+        &mut self,
+        visible_bounds: Bounds<Pixels>,
+        corner_radii: Corners<Pixels>,
+        corner_smoothing: f32,
+        grayscale: bool,
+        tile: AtlasTile,
+    ) {
+        let visible_bounds_snapped = self.snap_bounds(visible_bounds);
         let content_mask = self.snapped_content_mask();
         let corner_radii = corner_radii
             .clamp_radii_for_quad_size(visible_bounds.size)
@@ -5191,10 +5245,9 @@ impl Window {
             bounds: visible_bounds_snapped,
             content_mask,
             corner_radii,
-            tile: sub_tile,
+            tile,
             opacity: 1.0,
         });
-        Ok(())
     }
 
     /// Paint a surface into the scene for the next frame at the current z-index.

@@ -1,4 +1,4 @@
-use crate::{DevicePixels, Pixels, Result, SharedString, Size, size};
+use crate::{AtlasTextureKind, DevicePixels, Pixels, Result, SharedString, Size, size};
 use gpui_util::ResultExt;
 use smallvec::SmallVec;
 
@@ -209,11 +209,53 @@ impl AssetRegistry {
 #[derive(Copy, Clone, Debug, Eq, PartialEq, Ord, PartialOrd, Hash)]
 pub struct ImageId(pub usize);
 
+impl ImageId {
+    fn next() -> Self {
+        static NEXT_ID: AtomicUsize = AtomicUsize::new(0);
+        Self(NEXT_ID.fetch_add(1, SeqCst))
+    }
+}
+
 #[derive(PartialEq, Eq, Hash, Clone)]
 #[expect(missing_docs)]
 pub struct RenderImageParams {
     pub image_id: ImageId,
     pub frame_index: usize,
+}
+
+/// An atlas cache key for a tightly packed, straight-alpha BGRA8 image.
+/// Supply the pixels when painting the image for the first time.
+#[derive(Debug)]
+pub struct BgraImage {
+    pub(crate) size: Size<DevicePixels>,
+    id: ImageId,
+}
+
+impl BgraImage {
+    /// Allocates a new identity for these pixel dimensions. Use a new identity
+    /// whenever the image's contents change.
+    pub fn new(size: Size<DevicePixels>) -> Result<Self> {
+        AtlasTextureKind::Polychrome.upload_byte_len(size)?;
+        Ok(Self {
+            size,
+            id: ImageId::next(),
+        })
+    }
+
+    /// Reserves storage for one packed BGRA8 image. The producer can initialize
+    /// the reserved bytes when it first writes pixels.
+    pub fn reserve_pixels(size: Size<DevicePixels>) -> Result<Vec<u8>> {
+        let mut pixels = Vec::new();
+        pixels.try_reserve_exact(AtlasTextureKind::Polychrome.upload_byte_len(size)?)?;
+        Ok(pixels)
+    }
+
+    pub(crate) fn params(&self) -> RenderImageParams {
+        RenderImageParams {
+            image_id: self.id,
+            frame_index: 0,
+        }
+    }
 }
 
 /// A cached and processed image, in BGRA format
@@ -236,10 +278,8 @@ impl Eq for RenderImage {}
 impl RenderImage {
     /// Create a new image from the given data.
     pub fn new(data: impl Into<SmallVec<[Frame; 1]>>) -> Self {
-        static NEXT_ID: AtomicUsize = AtomicUsize::new(0);
-
         Self {
-            id: ImageId(NEXT_ID.fetch_add(1, SeqCst)),
+            id: ImageId::next(),
             scale_factor: 1.0,
             data: data.into(),
         }
@@ -296,6 +336,18 @@ impl fmt::Debug for RenderImage {
 mod tests {
     use super::*;
     use smallvec::SmallVec;
+
+    #[test]
+    fn borrowed_bgra_image_reserves_storage_and_uses_the_shared_image_identity_space() {
+        let dimensions = size(DevicePixels(4), DevicePixels(3));
+        let first = BgraImage::new(dimensions).unwrap();
+        let second = BgraImage::new(dimensions).unwrap();
+        let owned = RenderImage::new(SmallVec::new());
+        assert_ne!(first.params().image_id, second.params().image_id);
+        assert_ne!(first.params().image_id, owned.id);
+        assert!(BgraImage::reserve_pixels(dimensions).unwrap().capacity() >= 4 * 3 * 4);
+        assert!(BgraImage::reserve_pixels(size(DevicePixels(0), DevicePixels(3))).is_err());
+    }
 
     #[test]
     fn empty_render_image_does_not_panic() {
