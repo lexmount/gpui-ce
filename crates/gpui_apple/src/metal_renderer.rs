@@ -40,6 +40,10 @@ use wgsl_rs::std::{vec2f, vec4f};
 
 use std::{cell::Cell, mem, ptr, sync::Arc};
 
+#[path = "planar_video.rs"]
+mod planar_video;
+use planar_video::PlanarVideoRenderer;
+
 // Use 4x MSAA, all devices support it.
 // https://developer.apple.com/documentation/metal/mtldevice/1433355-supportstexturesamplecount
 const PATH_SAMPLE_COUNT: u32 = 4;
@@ -251,6 +255,7 @@ pub struct MetalRenderer {
     polychrome_sprites_pipeline_state: metal::RenderPipelineState,
     smoothed_polychrome_sprites_pipeline_state: metal::RenderPipelineState,
     surfaces_pipeline_state: metal::RenderPipelineState,
+    planar_video: PlanarVideoRenderer,
     // Blur pipelines: downsample (no blend, also used for the final blit), separable gaussian
     // (no blend), and composite (alpha blend into a rounded rect), from shared shader sources.
     blur_downsample_pipeline_state: metal::RenderPipelineState,
@@ -488,6 +493,7 @@ impl MetalRenderer {
         let sprite_atlas = Arc::new(MetalAtlas::new(device.clone(), is_apple_gpu));
         let core_video_texture_cache =
             CVMetalTextureCache::new(None, device.clone(), None).unwrap();
+        let planar_video = PlanarVideoRenderer::new(&device);
 
         Self {
             device,
@@ -508,6 +514,7 @@ impl MetalRenderer {
             polychrome_sprites_pipeline_state,
             smoothed_polychrome_sprites_pipeline_state,
             surfaces_pipeline_state,
+            planar_video,
             blur_downsample_pipeline_state,
             blur_pipeline_state,
             blur_composite_pipeline_state,
@@ -1035,6 +1042,7 @@ impl MetalRenderer {
                     &scene.surfaces[range.clone()],
                     &scene_uniforms,
                     command_encoder,
+                    command_buffer,
                 ),
                 RenderCommand::Batch(PrimitiveBatch::BackdropFilters(range)) => {
                     command_encoder.end_encoding();
@@ -1865,14 +1873,27 @@ impl MetalRenderer {
         surfaces: &[PaintSurface],
         scene_uniforms: &SceneUniforms,
         command_encoder: &metal::RenderCommandEncoderRef,
+        command_buffer: &metal::CommandBufferRef,
     ) -> bool {
-        command_encoder.set_render_pipeline_state(&self.surfaces_pipeline_state);
         bind_scene_uniforms(command_encoder, scene_uniforms);
-        command_encoder.set_fragment_sampler_state(SAMPLER_SLOT, Some(&self.sampler));
-
+        let mut retained_video = SmallVec::<[_; 4]>::new();
         for surface in surfaces {
             let image_buffer = match &surface.source {
                 SurfaceSource::Surface(image_buffer) => image_buffer,
+                SurfaceSource::PlanarVideo(video) => {
+                    match self.planar_video.draw(
+                        surface,
+                        video,
+                        &self.core_video_texture_cache,
+                        command_encoder,
+                    ) {
+                        Ok(planes) => retained_video.push((planes, video.clone())),
+                        Err(error) => {
+                            log::error!("Metal could not draw the planar video surface: {error}")
+                        }
+                    }
+                    continue;
+                }
                 SurfaceSource::Unsupported(size) => {
                     log::error!("Metal cannot draw unsupported surface source with size {size:?}");
                     continue;
@@ -1885,6 +1906,8 @@ impl MetalRenderer {
                     continue;
                 }
             };
+            command_encoder.set_render_pipeline_state(&self.surfaces_pipeline_state);
+            command_encoder.set_fragment_sampler_state(SAMPLER_SLOT, Some(&self.sampler));
 
             assert_eq!(
                 image_buffer.get_pixel_format(),
@@ -1946,6 +1969,13 @@ impl MetalRenderer {
             });
 
             command_encoder.draw_primitives(metal::MTLPrimitiveType::TriangleStrip, 0, 4);
+        }
+        if !retained_video.is_empty() {
+            // Keep the CoreVideo texture wrappers, pixel buffers, and producer
+            // leases alive through the last GPU read.
+            let frames = Cell::new(Some(retained_video));
+            let completion = ConcreteBlock::new(move |_| drop(frames.take()));
+            command_buffer.add_completed_handler(&completion.copy());
         }
         true
     }

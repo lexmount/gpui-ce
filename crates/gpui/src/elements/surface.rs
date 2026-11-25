@@ -8,12 +8,34 @@ use crate::{
 use core_video::pixel_buffer::CVPixelBuffer;
 use refineable::Refineable;
 
+/// An IOSurface-backed I420 frame and its sampling parameters.
+#[cfg(target_os = "macos")]
+#[derive(Clone, Debug)]
+pub struct PlanarVideoSurface {
+    /// An immutable 8-bit, three-plane Y′CbCr pixel buffer.
+    pub buffer: CVPixelBuffer,
+    /// Visible x, y, width and height in luma pixels, excluding decoder padding.
+    /// The origin must be aligned to the chroma grid.
+    pub visible_rect: [u32; 4],
+    /// Rows of the matrix mapping normalized [Y′, Cb, Cr, 1] to output RGB.
+    pub color_conversion: [[f32; 4]; 3],
+    /// Offset in chroma texels for the frame's chroma siting.
+    pub chroma_offset: [f32; 2],
+    /// Use nearest-neighbor sampling for scaling.
+    pub nearest: bool,
+    /// Optional producer-owned lease to retain through GPU completion.
+    pub lease: Option<std::sync::Arc<dyn std::any::Any + Send + Sync>>,
+}
+
 /// A source of a surface's content.
 #[derive(Clone)]
 pub enum SurfaceSource {
     /// A macOS image buffer from CoreVideo
     #[cfg(target_os = "macos")]
     Surface(CVPixelBuffer),
+    /// A three-plane video frame for the native Metal renderer.
+    #[cfg(target_os = "macos")]
+    PlanarVideo(PlanarVideoSurface),
     /// A GPU texture handle (type-erased to avoid depending on wgpu)
     #[cfg(any(
         target_os = "linux",
@@ -46,6 +68,8 @@ impl std::fmt::Debug for SurfaceSource {
         match *self {
             #[cfg(target_os = "macos")]
             SurfaceSource::Surface(ref buf) => _f.debug_tuple("Surface").field(buf).finish(),
+            #[cfg(target_os = "macos")]
+            SurfaceSource::PlanarVideo(ref video) => video.fmt(_f),
             #[cfg(any(
                 target_os = "linux",
                 target_os = "freebsd",
@@ -70,6 +94,10 @@ impl SurfaceSource {
             SurfaceSource::Surface(buffer) => {
                 crate::size(buffer.get_width().into(), buffer.get_height().into())
             }
+            #[cfg(target_os = "macos")]
+            SurfaceSource::PlanarVideo(video) => {
+                crate::size(video.visible_rect[2].into(), video.visible_rect[3].into())
+            }
             #[cfg(any(
                 target_os = "linux",
                 target_os = "freebsd",
@@ -81,6 +109,13 @@ impl SurfaceSource {
             SurfaceSource::WindowsCapture(frame) => frame.size(),
             SurfaceSource::Unsupported(size) => *size,
         }
+    }
+}
+
+#[cfg(target_os = "macos")]
+impl From<PlanarVideoSurface> for SurfaceSource {
+    fn from(value: PlanarVideoSurface) -> Self {
+        Self::PlanarVideo(value)
     }
 }
 
